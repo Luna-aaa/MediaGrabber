@@ -1,0 +1,20 @@
+# 受控 Chrome 的配置目录：包含登录凭据，绝对不能提交
+chrome-profile/
+
+# 运行时生成
+logs/
+config.json
+history.jsonl
+# 标定图是按显示器型号命名的（_dpi_reference_NE160QDM_NZB.png），要用通配符
+tools/_dpi_reference*.png
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller（阶段 4）
+build/
+dist/
+*.spec

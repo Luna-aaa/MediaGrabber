@@ -1,0 +1,28 @@
+# MediaGrabber 依赖清单
+# 版本已针对 Python 3.13 核实：全部有现成 wheel，无需本地编译
+#
+# 安装方式（在项目根目录、虚拟环境激活后执行）：
+#   pip install -r requirements.txt
+#
+# 国内网络慢的话加清华镜像：
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# --- 阶段 1 必需 ---------------------------------------------------------
+# 用 PySide6-Essentials 而不是 PySide6：
+# PySide6 元包 = Essentials(77MB) + Addons(约 130MB)。
+# 本项目只用 QtCore / QtGui / QtWidgets，全部在 Essentials 里；
+# Addons 那 130MB（QtWebEngine、Qt3D、QtCharts、QtMultimedia 等）一个都用不到。
+# 少下 130MB，阶段 4 打出来的 exe 也会小很多。
+# 万一以后真需要 Addons，直接 pip install PySide6 就能补上，不用改代码。
+PySide6-Essentials==6.11.2
+mss==10.2.0
+Pillow==12.3.0
+pynput==1.8.2
+
+# --- 阶段 2（浏览器模式）需要 -------------------------------------------
+playwright==1.62.0
+httpx==0.28.1
+
+# --- 阶段 3（自动识别）需要 ---------------------------------------------
+# 故意不用最新的 5.0.x —— 那是大版本变更，API 有改动，稳妥起见锁在 4.x
+opencv-python==4.14.0.94
