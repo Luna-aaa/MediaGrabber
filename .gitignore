@@ -14,7 +14,10 @@ __pycache__/
 .venv/
 venv/
 
-# PyInstaller（阶段 4）
+# PyInstaller 的产物（阶段 4）。
+# mediagrabber.spec 是源码的一部分，要提交——所以这里不能写 *.spec
 build/
 dist/
-*.spec
+assets/mediagrabber.ico
+# 放在根目录那份 exe（131MB，不该进版本库）
+/MediaGrabber.exe
