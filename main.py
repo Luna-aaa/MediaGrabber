@@ -61,15 +61,18 @@ import os  # noqa: E402
 import socket  # noqa: E402
 
 from PySide6.QtCore import QObject, Qt, Signal  # noqa: E402
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap  # noqa: E402
+from PySide6.QtGui import QAction  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon  # noqa: E402
 
 from browser.controller import BrowserController  # noqa: E402
+from browser.controller import clear_profile as bc_clear_profile  # noqa: E402
 from core import downloader, naming  # noqa: E402
 from core.history import History  # noqa: E402
 from screen import capture  # noqa: E402
 from screen.overlay import OverlayController  # noqa: E402
+from ui.appicon import make_app_icon  # noqa: E402
 from ui.main_window import MainWindow  # noqa: E402
+from ui.settings import SettingsDialog  # noqa: E402
 from ui.toast import LEVEL_ERROR, LEVEL_INFO, LEVEL_WARN, ToastManager  # noqa: E402
 
 APP_NAME = "MediaGrabber"
@@ -168,40 +171,6 @@ class HotkeyManager:
 
 
 # ===========================================================================
-# 托盘图标
-# ===========================================================================
-
-
-def make_tray_icon() -> QIcon:
-    """
-    用代码画一个托盘图标（一台小相机），省得依赖外部图标文件。
-
-    画多个尺寸是为了在不同 DPI 的任务栏上都清晰。
-    """
-    icon = QIcon()
-    for size in (16, 24, 32, 48, 64):
-        pm = QPixmap(size, size)
-        pm.fill(Qt.GlobalColor.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        s = size / 64.0
-        p.setPen(Qt.PenStyle.NoPen)
-        # 机身
-        p.setBrush(QColor("#2563EB"))
-        p.drawRoundedRect(2 * s, 14 * s, 60 * s, 44 * s, 8 * s, 8 * s)
-        # 顶部取景器凸起
-        p.drawRoundedRect(20 * s, 6 * s, 24 * s, 10 * s, 3 * s, 3 * s)
-        # 镜头
-        p.setBrush(QColor("#FFFFFF"))
-        p.drawEllipse(int(18 * s), int(22 * s), int(28 * s), int(28 * s))
-        p.setBrush(QColor("#1E3A8A"))
-        p.drawEllipse(int(24 * s), int(28 * s), int(16 * s), int(16 * s))
-        p.end()
-        icon.addPixmap(pm)
-    return icon
-
-
-# ===========================================================================
 # 主程序
 # ===========================================================================
 
@@ -226,6 +195,7 @@ class MediaGrabberApp(QObject):
 
         self.overlay = OverlayController(self.cfg, parent=self)
         self.overlay.captured.connect(self.on_captured)
+        self.overlay.captured_batch.connect(self.on_captured_batch)
         self.overlay.finished.connect(self.on_overlay_finished)
 
         self.hotkey = HotkeyManager(str(self.cfg.get("hotkey.capture", "<ctrl>+<alt>+s")))
@@ -235,6 +205,9 @@ class MediaGrabberApp(QObject):
         # 只有你点了「启动浏览器」才会去开 Chrome。
         self.browser = BrowserController(self.cfg, self.history, parent=self)
         self.browser.notice.connect(self._on_browser_notice)
+        # 缓存一份「哪些网站有 cookie」，托盘里直接开设置面板时也能查看登录状态
+        self._login_domains: list[str] = []
+        self.browser.login_domains.connect(self._on_login_domains)
         self.browser.start()
         self.main_window: MainWindow | None = None
 
@@ -246,7 +219,7 @@ class MediaGrabberApp(QObject):
     # --- 托盘 ---------------------------------------------------------------
 
     def _build_tray(self) -> QSystemTrayIcon:
-        tray = QSystemTrayIcon(make_tray_icon(), self)
+        tray = QSystemTrayIcon(make_app_icon(), self)
         tray.setToolTip(f"{APP_NAME} —— 按 {self.hotkey.combo} 开始框选")
 
         menu = QMenu()
@@ -262,7 +235,7 @@ class MediaGrabberApp(QObject):
         menu.addAction(act_main)
 
         act_settings = QAction("设置", menu)
-        act_settings.triggered.connect(lambda: self._not_yet("设置面板", "阶段 3"))
+        act_settings.triggered.connect(self.show_settings)
         menu.addAction(act_settings)
 
         act_open = QAction("打开保存目录", menu)
@@ -289,24 +262,95 @@ class MediaGrabberApp(QObject):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.show_main_window()
 
-    def _not_yet(self, what: str, stage: str) -> None:
-        self.toasts.show(f"{what}还没做", f"计划在{stage}提供", LEVEL_WARN)
-
     def show_main_window(self) -> None:
         """
-        打开（或前置）浏览器模式主窗口。
+        打开（或前置）主窗口（浏览器模式 + 历史记录）。
 
         窗口是懒创建的：不点开就不占内存，也不会在启动时拖慢速度。
         关掉窗口不会退出程序，程序继续在托盘里待命。
         """
         if self.main_window is None:
-            self.main_window = MainWindow(self.cfg, self.browser)
+            self.main_window = MainWindow(self.cfg, self.browser, self.history)
+            self.main_window.settings_requested.connect(self.show_settings)
             # 首次使用提示：profile 目录还不存在，说明从没登录过
             if not self.cfg.profile_path().exists():
                 self.main_window.show_first_run_hint()
         self.main_window.show()
         self.main_window.raise_()
         self.main_window.activateWindow()
+
+    # --- 设置面板（阶段 3）--------------------------------------------------
+
+    def show_settings(self) -> None:
+        """
+        打开设置面板。
+
+        每次都新建一个：面板打开期间配置可能被别处改动（比如「首次提示」标记），
+        复用同一个实例会显示过期的值。
+
+        这里先触发一次登录域名刷新，这样你点进「查看登录状态」时数据已经到了。
+        """
+        try:
+            self.browser.refresh_login_domains()
+        except Exception:
+            log.debug("刷新登录域名失败（不影响打开设置）", exc_info=True)
+
+        dialog = SettingsDialog(
+            self.cfg,
+            log_dir=_LOG_PATH.parent,
+            login_provider=lambda: (list(self._login_domains), self.cfg.profile_path()),
+            clear_login=lambda: bc_clear_profile(self.cfg.profile_path()),
+            parent=self.main_window,
+        )
+        dialog.applied.connect(self._on_settings_applied)
+        dialog.exec()
+
+    def _on_login_domains(self, domains: list) -> None:
+        """浏览器控制器报回来「哪些域名有 cookie」，缓存着给设置面板用。"""
+        self._login_domains = [str(d) for d in domains]
+
+    def _on_settings_applied(self, changed: dict) -> None:
+        """
+        设置保存之后，把需要立刻生效的东西重新装一遍。
+
+        参数 changed：{"字段路径": (旧值, 新值)}
+
+        大部分设置项不用管——保存目录、识别阈值这些都是用到的时候现读的。
+        只有两样东西是「装好就一直在那」的，必须主动重装：
+            热键     —— pynput 的监听器已经绑在旧组合上了
+            日志级别 —— logging 的配置是全局的
+        """
+        if "hotkey.capture" in changed:
+            self._reload_hotkey(str(changed["hotkey.capture"][1]))
+
+        if "log.level" in changed or "log.keep_days" in changed:
+            level = str(self.cfg.get("log.level", "INFO"))
+            keep = int(self.cfg.get("log.keep_days", 30) or 30)
+            applog.setup_logging(_APP_DIR, level, keep)
+            log.info("日志级别已改为 %s", level)
+
+        self.toasts.show("设置已保存", f"改动了 {len(changed)} 项", LEVEL_INFO)
+
+    def _reload_hotkey(self, combo: str) -> None:
+        """
+        换一个全局热键，不用重启程序。
+
+        pynput 的监听器停掉之后不能再启动，所以这里是**丢掉旧的、建一个新的**。
+        新的注册失败时要明确告诉用户，否则就是「改完热键之后按啥都没反应」。
+        """
+        self.hotkey.stop()
+        self.hotkey = HotkeyManager(combo)
+        self.hotkey.signals.triggered.connect(self.on_hotkey)
+        if self.hotkey.start():
+            self.tray.setToolTip(f"{APP_NAME} —— 按 {combo} 开始框选")
+            self.toasts.show("热键已更新", f"现在按 {combo} 开始框选", LEVEL_INFO)
+        else:
+            self.toasts.show(
+                "新热键注册失败",
+                f"{combo} 可能被别的软件占用了。可以从托盘菜单点「立即框选」，"
+                f"或者到设置里换一个组合。",
+                LEVEL_ERROR,
+            )
 
     def _on_browser_notice(self, title: str, detail: str, level: str) -> None:
         """浏览器控制器要弹提示条（可能来自浏览器线程，靠信号已经切回主线程了）。"""
@@ -363,36 +407,38 @@ class MediaGrabberApp(QObject):
 
     # --- 落盘 ---------------------------------------------------------------
 
-    def on_captured(self, image, source: str) -> None:
+    def _screen_save_dir(self):
         """
-        拿到裁好的图，走公共落盘链路存到磁盘。
+        算出通用模式该存到哪个目录。
+
+        什么情况会失败：盘符不存在、没有写权限 -> 抛异常，由调用方弹提示条。
+        """
+        return naming.build_save_dir(
+            self.cfg.save_root(),
+            "screen",
+            screen_subdir=str(self.cfg.get("save.screen_subdir", "Screen")),
+            split_by_date=bool(self.cfg.get("save.split_by_date", True)),
+        )
+
+    def _save_one_image(self, image, source: str, directory):
+        """
+        存一张截图。单张和批量两条路径共用这一个方法。
 
         参数：
-            image  —— QImage，已经是物理像素、和屏幕内容一一对应
-            source —— 来源屏幕名，写进历史记录
+            image     —— QImage，物理像素，和屏幕内容一一对应
+            source    —— 来源屏幕名，写进历史记录
+            directory —— 已经算好并建好的目标目录
 
-        全过程包在 try 里：保存失败必须弹红色提示条 + 写日志，绝不静默。
+        返回：SaveResult；编码失败时返回一个 ok=False 的结果，不抛异常——
+        批量保存时一张失败不能拖累其余的。
         """
         try:
             png = capture.qimage_to_png_bytes(image)
         except Exception as e:
             log.exception("PNG 编码失败")
-            self.toasts.show("保存失败", f"图像编码失败：{e}", LEVEL_ERROR)
-            return
+            return downloader.SaveResult(ok=False, error=f"图像编码失败：{e}")
 
-        try:
-            directory = naming.build_save_dir(
-                self.cfg.save_root(),
-                "screen",
-                screen_subdir=str(self.cfg.get("save.screen_subdir", "Screen")),
-                split_by_date=bool(self.cfg.get("save.split_by_date", True)),
-            )
-        except Exception as e:
-            log.exception("计算保存目录失败")
-            self.toasts.show("保存失败", str(e), LEVEL_ERROR)
-            return
-
-        result = downloader.save_bytes(
+        return downloader.save_bytes(
             png,
             directory,
             naming.screen_filename(),
@@ -404,6 +450,68 @@ class MediaGrabberApp(QObject):
             width=image.width(),
             height=image.height(),
         )
+
+    def on_captured_batch(self, images, source: str) -> None:
+        """
+        自动识别模式下按 Enter，一次存好几张。
+
+        参数 images 是 QImage 列表，顺序就是屏幕上从上到下、从左到右的顺序。
+
+        提示条只弹一条汇总的。每张弹一条的话，选了 10 张就会刷屏。
+        """
+        if not images:
+            return
+
+        try:
+            directory = self._screen_save_dir()
+        except Exception as e:
+            log.exception("计算保存目录失败")
+            self.toasts.show("保存失败", str(e), LEVEL_ERROR)
+            return
+
+        ok = skipped = 0
+        errors: list[str] = []
+        for image in images:
+            result = self._save_one_image(image, source, directory)
+            if not result.ok:
+                errors.append(result.error or "未知原因")
+            elif result.skipped:
+                skipped += 1
+            else:
+                ok += 1
+
+        parts = [f"已保存 {ok} 张"]
+        if skipped:
+            parts.append(f"{skipped} 张内容重复已跳过")
+        if errors:
+            parts.append(f"{len(errors)} 张失败")
+
+        level = LEVEL_ERROR if errors and not ok else (LEVEL_WARN if errors or skipped else LEVEL_INFO)
+        detail = str(directory)
+        if errors:
+            # 只显示第一条失败原因，完整的在日志里
+            detail = f"{errors[0]}\n{detail}"
+            log.error("批量保存有 %d 张失败：%s", len(errors), errors)
+        self.toasts.show("，".join(parts), detail, level)
+
+    def on_captured(self, image, source: str) -> None:
+        """
+        拿到裁好的图，走公共落盘链路存到磁盘。
+
+        参数：
+            image  —— QImage，已经是物理像素、和屏幕内容一一对应
+            source —— 来源屏幕名，写进历史记录
+
+        全过程包在 try 里：保存失败必须弹红色提示条 + 写日志，绝不静默。
+        """
+        try:
+            directory = self._screen_save_dir()
+        except Exception as e:
+            log.exception("计算保存目录失败")
+            self.toasts.show("保存失败", str(e), LEVEL_ERROR)
+            return
+
+        result = self._save_one_image(image, source, directory)
 
         if not result.ok:
             self.toasts.show("保存失败", result.error or "未知原因", LEVEL_ERROR)
@@ -450,6 +558,77 @@ class MediaGrabberApp(QObject):
         self.app.quit()
 
 
+def show_fatal_message(text: str) -> None:
+    """
+    弹一个系统消息框，告诉用户程序为什么起不来。
+
+    参数：text —— 给用户看的中文说明
+
+    有控制台时（源码运行、或从终端跑）只打印；没有控制台时（打包成
+    不带黑窗口的 exe，`sys.stderr` 干脆是 None）才弹消息框。
+
+    为什么要分这两种情况：
+    - 不弹窗的话，双击 exe 之后什么都没发生，你只能一脸茫然
+    - 总是弹窗的话，命令行里跑任何自动化脚本都会被一个模态框卡住
+
+    用 ctypes 直接调 Win32 的 MessageBoxW，不依赖 Qt，
+    所以在 QApplication 还没创建出来的时候也能用。
+    """
+    if sys.stderr is not None:
+        print(text, file=sys.stderr)
+        return
+
+    try:
+        import ctypes
+
+        # 0x30 = MB_ICONWARNING，0x40000 = MB_TOPMOST（别被别的窗口盖住）
+        ctypes.windll.user32.MessageBoxW(None, text, APP_NAME, 0x30 | 0x40000)
+    except Exception:
+        log.exception("弹提示框失败（不影响退出）")
+
+
+def run_selftest() -> int:
+    """
+    自检模式：`MediaGrabber.exe --selftest`
+
+    把环境自检跑一遍，结果写进日志、再用一个消息框显示出来。
+
+    为什么打包成 exe 之后特别需要它：exe 没有控制台窗口，出问题时你
+    什么都看不到。而打包最容易出的毛病恰恰是「少收了某个文件」——
+    比如 playwright 的 driver 没打进去，表现是程序能开、框选也正常，
+    唯独点「启动浏览器」没反应。自检会把每一项依赖都真的调用一次，
+    缺什么当场就报出来。
+
+    返回：0 全部通过；1 有失败项；2 自检本身就崩了。
+
+    这个模式不占单实例端口，所以程序正开着的时候也能跑。
+    """
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    try:
+        from tools import env_check
+
+        with contextlib.redirect_stdout(buf):
+            code = env_check.main()
+        text = buf.getvalue()
+    except Exception as e:
+        log.exception("自检本身出错了")
+        show_fatal_message(
+            f"自检没能跑完：{e}\n\n"
+            f"这本身就说明打包漏了东西。详情见 logs 目录。"
+        )
+        return 2
+
+    for line in text.splitlines():
+        log.info("[自检] %s", line)
+
+    # 消息框里全文显示。真出问题时截图发过来最省事，别只给个结论。
+    show_fatal_message(text.strip() or "自检没有任何输出，这不正常。")
+    return code
+
+
 def acquire_single_instance_lock() -> socket.socket | None:
     """
     保证同时只有一个实例在跑。
@@ -475,6 +654,12 @@ def acquire_single_instance_lock() -> socket.socket | None:
 
 
 def main() -> int:
+    # 自检要在一切之前处理：它不占单实例端口，也不建托盘，
+    # 所以程序正开着的时候也能跑一次自检。
+    if "--selftest" in sys.argv:
+        log.info("以自检模式启动")
+        return run_selftest()
+
     log.info("=" * 70)
     log.info("%s 启动", APP_NAME)
     log.info("程序目录：%s", _APP_DIR)
@@ -497,7 +682,12 @@ def main() -> int:
     lock = acquire_single_instance_lock()
     if lock is None:
         log.error("已经有一个 %s 在运行了，本次启动取消。", APP_NAME)
-        print(f"{APP_NAME} 已经在运行（看一下右下角托盘区）。", file=sys.stderr)
+        show_fatal_message(
+            f"{APP_NAME} 已经在运行了。\n\n"
+            f"看一下屏幕右下角的托盘区（可能要点那个向上的小箭头），"
+            f"蓝色相机图标就是它。\n"
+            f"双击那个图标可以打开主窗口。"
+        )
         return 1
 
     app = QApplication(sys.argv)
@@ -507,7 +697,11 @@ def main() -> int:
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         log.error("当前系统没有可用的托盘区，程序无法运行。")
-        print("系统托盘不可用，程序无法运行。", file=sys.stderr)
+        show_fatal_message(
+            "系统托盘不可用，程序无法运行。\n\n"
+            "本程序是常驻托盘的，没有托盘区就没有任何入口。\n"
+            "试试重启一下资源管理器（任务管理器里找 explorer.exe）。"
+        )
         return 2
 
     grabber = MediaGrabberApp(app)

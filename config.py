@@ -70,15 +70,17 @@ DEFAULTS: dict[str, Any] = {
         # 拖到离屏幕边缘这么近（逻辑像素）时自动吸附到边缘。设 0 可关闭。
         "edge_snap_px": 2,
     },
-    "detector": {  # 阶段 3 · 自动识别，全部阈值可调
-        "min_area": 10000,
-        "min_aspect": 0.2,
-        "max_aspect": 5.0,
-        "min_rectangularity": 0.60,
-        "canny_low": 50,
-        "canny_high": 150,
-        "blur_kernel": 5,
-        "nms_iou": 0.80,
+    # 阶段 3 · 自动识别（点选式）。设置面板里都能调，不用手改这里。
+    # 注意这一段在 2026-08-31 换过一次：旧的 min_area / min_aspect /
+    # max_aspect / min_rectangularity / nms_iou / drop_containers 都不用了。
+    # 那些是「先扫全屏再筛选」时代的参数，而筛选正是漏检的来源。
+    "detector": {
+        "canny_low": 50,              # 边缘检测低阈值，整体检不到边缘时调小
+        "canny_high": 150,            # 边缘检测高阈值
+        "blur_kernel": 5,             # 高斯模糊核，必须是奇数。调大能减少「一张切两半」
+        "min_side": 24,               # 候选框最小边长，比这小的当噪声
+        "max_area_ratio": 0.98,       # 候选框最大能占屏幕多大
+        "level_gap": 0.15,            # 相邻层级至少差这么多面积，滚轮才有明显变化
     },
     "browser": {  # 阶段 2 · 浏览器模式
         "debug_port": 9222,

@@ -79,10 +79,14 @@ def setup_logging(app_dir: Path, level: str = "INFO", keep_days: int = 30) -> Pa
 
     formatter = logging.Formatter(_FORMAT, datefmt=_DATEFMT)
 
-    # 控制台
-    console = logging.StreamHandler(stream=sys.stderr)
-    console.setFormatter(formatter)
-    root.addHandler(console)
+    # 控制台。
+    # 打包成不带控制台窗口的 exe 之后（PyInstaller --noconsole），
+    # sys.stderr 是 **None**，往它身上装 StreamHandler 会在第一条日志时炸掉。
+    # 所以这里必须先确认它真的存在——日志文件那一路照常工作，什么都不会丢。
+    if sys.stderr is not None:
+        console = logging.StreamHandler(stream=sys.stderr)
+        console.setFormatter(formatter)
+        root.addHandler(console)
 
     log_path = log_dir / LOG_BASENAME
     try:

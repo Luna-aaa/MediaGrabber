@@ -91,7 +91,8 @@ def check_packages() -> None:
         ("PIL", "Pillow", "图像处理", True),
         ("playwright", "playwright", "浏览器模式", True),
         ("httpx", "httpx", "下载兜底", True),
-        ("cv2", "opencv-python", "自动识别（阶段 3）", False),
+        ("cv2", "opencv-python", "自动识别", True),
+        ("numpy", "numpy", "自动识别（opencv 的依赖，会自动装上）", True),
     ]
     for module_name, pip_name, purpose, required in packages:
         try:

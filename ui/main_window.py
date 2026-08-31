@@ -29,24 +29,26 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
-    QDialog,
-    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QListWidget,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from browser import controller as bc
 from browser import scanner
+from ui.history_panel import HistoryPanel
+# 登录状态面板放在 ui/settings.py 里（它属于「设置」的一部分）。
+# 从那边导入而不是反过来，是为了避免循环导入：设置面板不需要认识主窗口。
+from ui.settings import LoginStateDialog
 
 log = logging.getLogger(__name__)
 
@@ -181,77 +183,28 @@ class MediaCard(QFrame):
         return self.checkbox.isChecked() and self.checkbox.isEnabled()
 
 
-class LoginStateDialog(QDialog):
-    """
-    登录状态面板（CLAUDE.md 第 6.4 节）。
-
-    列出受控浏览器里有 cookie 的域名，让你一眼看出哪些站点已经登录过；
-    并提供「清除登录数据」按钮（需二次确认）。
-    """
-
-    clear_requested = Signal()
-
-    def __init__(self, domains: list[str], profile_path, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setWindowTitle("登录状态")
-        self.resize(420, 460)
-
-        layout = QVBoxLayout(self)
-
-        tip = QLabel(
-            "下面是受控浏览器里存有 cookie 的网站。\n"
-            "有 cookie 通常意味着你在这个站点登录过（但不保证登录仍然有效）。",
-            self,
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color:#9CA3AF;")
-        layout.addWidget(tip)
-
-        self.list = QListWidget(self)
-        if domains:
-            self.list.addItems(domains)
-        else:
-            self.list.addItem("（还没有任何 cookie —— 先连接浏览器并登录一个网站）")
-        layout.addWidget(self.list, 1)
-
-        path_label = QLabel(f"数据目录：{profile_path}", self)
-        path_label.setWordWrap(True)
-        path_label.setStyleSheet("color:#6B7280; font-size:11px;")
-        layout.addWidget(path_label)
-
-        clear_btn = QPushButton("清除登录数据…", self)
-        clear_btn.setStyleSheet("color:#EF4444;")
-        clear_btn.clicked.connect(self._confirm_clear)
-        layout.addWidget(clear_btn)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
-        buttons.rejected.connect(self.reject)
-        buttons.accepted.connect(self.accept)
-        layout.addWidget(buttons)
-
-    def _confirm_clear(self) -> None:
-        answer = QMessageBox.warning(
-            self,
-            "确认清除登录数据",
-            "这会删除整个 chrome-profile 目录，你在受控浏览器里的\n"
-            "所有登录状态、Cookie、书签都会消失，且无法恢复。\n\n"
-            "清除前请先把受控 Chrome 完全关掉，否则会删不干净。\n\n"
-            "确定要继续吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            self.clear_requested.emit()
-            self.accept()
-
-
 class MainWindow(QWidget):
-    """浏览器模式的主界面。"""
+    """
+    主窗口。两个标签页：浏览器模式 / 历史记录，右上角一个「设置」按钮
+    （CLAUDE.md 4.3）。
 
-    def __init__(self, cfg, controller: bc.BrowserController, parent: QWidget | None = None):
+    发出的信号：
+        settings_requested() —— 点了「设置」。窗口自己不打开设置面板，
+                                交给 main.py 去开——设置面板要能改热键、
+                                改日志级别，这些是全局的事，主窗口管不着。
+                                顺带也避免了主窗口和设置面板互相 import。
+    """
+
+    settings_requested = Signal()
+
+    def __init__(
+        self, cfg, controller: bc.BrowserController,
+        history=None, parent: QWidget | None = None,
+    ):
         super().__init__(parent)
         self.cfg = cfg
         self.controller = controller
+        self._history = history
 
         self._items: list[dict[str, Any]] = []
         self._cards: list[MediaCard] = []
@@ -260,16 +213,48 @@ class MainWindow(QWidget):
         # (列数, 可见卡片的序号元组)。和上次一样就不用重排。
         self._layout_signature: tuple | None = None
 
-        self.setWindowTitle("MediaGrabber —— 浏览器模式")
+        self.setWindowTitle("MediaGrabber")
         self.resize(940, 720)
         self._build_ui()
+        self._build_tabs()
         self._connect_signals()
         self._update_counts()
 
     # --- 界面搭建 -----------------------------------------------------------
 
+    def _build_tabs(self) -> None:
+        """
+        把浏览器页和历史页装进标签栏，右上角放「设置」按钮。
+
+        没传 history 时不显示历史标签页——这样别的地方想单独用浏览器界面
+        也不会因为少一个参数就崩。
+        """
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self.tabs = QTabWidget(self)
+        self.tabs.addTab(self.browser_page, "浏览器模式")
+
+        self.history_page = None
+        if self._history is not None:
+            self.history_page = HistoryPanel(self._history, self)
+            self.tabs.addTab(self.history_page, "历史记录")
+            # 每次切到历史页都重新读一遍文件：刚截的图、刚下载的图立刻能看到
+            self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        btn_settings = QPushButton("设置", self)
+        btn_settings.clicked.connect(self.settings_requested.emit)
+        self.tabs.setCornerWidget(btn_settings, Qt.Corner.TopRightCorner)
+
+        outer.addWidget(self.tabs)
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self.history_page is not None and self.tabs.widget(index) is self.history_page:
+            self.history_page.refresh()
+
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
+        self.browser_page = QWidget(self)
+        root = QVBoxLayout(self.browser_page)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 

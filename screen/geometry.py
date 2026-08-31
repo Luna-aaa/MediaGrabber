@@ -158,6 +158,22 @@ class ScreenMap:
             self.py + round(local_ly * self.sy),
         )
 
+    def to_local_logical(self, local_px: float, local_py: float) -> tuple[float, float]:
+        """
+        to_physical() 的反向换算：「本屏物理坐标」-> 「本屏窗口内逻辑坐标」。
+
+        参数是相对本屏左上角的**物理**坐标（不是虚拟桌面坐标，调用前先减掉 px/py）。
+
+        阶段 3 加的，给自动识别用：识别是在物理像素的画面上做的，得到的框
+        要画到 Qt 窗口上就必须换回逻辑坐标。
+
+        故意返回 float 不取整：这个结果只用于**绘制**，保留小数能让框的位置
+        更准；真正保存时走的是原始物理坐标，一个像素都不会因为换算而丢失。
+        """
+        sx = self.sx or 1.0
+        sy = self.sy or 1.0
+        return (local_px / sx, local_py / sy)
+
     def clamp_physical(self, x: int, y: int) -> tuple[int, int]:
         """把物理坐标夹进本屏范围内，避免鼠标甩出屏幕导致裁剪越界。"""
         return (
